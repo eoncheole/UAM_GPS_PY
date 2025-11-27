@@ -1,55 +1,71 @@
 #!/usr/bin/env python3
 """
-SITL UDP GPS 스푸핑 - PX4 v1.14 + pymavlink 2.4.49
-학술 연구용: GPS 스푸핑 시뮬레이션 및 IDS 데이터 수집
+SITL UDP GPS 스푸핑 - Windows 호환 버전
+PX4 v1.14 + pymavlink 2.4.49 + X-Plane 12
+
+연결 방식: udp:0.0.0.0:14540 (양방향 수신/송신)
 """
 import os
-os.environ['MAVLINK20'] = '1'  # MAVLink 2 강제 활성화
+os.environ['MAVLINK20'] = '1'
 
 import time
 import math
+import sys
 from pymavlink import mavutil
 
-class SITLGPSSpoofer:
-    def __init__(self, connection_string='udpout:127.0.0.1:14540'):
+class SITLUDPSpoofer:
+    def __init__(self, listen_port=14540):
+        """
+        Windows 호환 UDP 연결
+        
+        Args:
+            listen_port: 수신 포트 (QGC와 다른 포트 사용)
+        """
+        # 양방향 UDP 연결 (Windows 호환)
+        connection_string = f'udpin:0.0.0.0:{listen_port}'
+        print(f"연결 문자열: {connection_string}")
+        
         self.master = mavutil.mavlink_connection(
             connection_string,
-            source_system=1,
-            source_component=191
+            source_system=255,
+            source_component=190
         )
         self.boot_time = time.time()
-        self.original_lat = None
-        self.original_lon = None
-        self.original_alt = None
+        self.target_system = 1
+        self.target_component = 1
         
-    def wait_heartbeat(self):
-        """하트비트 대기 및 연결 확인"""
-        print("하트비트 대기 중...")
-        self.master.wait_heartbeat()
-        print(f"연결됨: system {self.master.target_system}, component {self.master.target_component}")
+    def wait_heartbeat(self, timeout=30):
+        """하트비트 대기"""
+        print(f"하트비트 대기 중... (최대 {timeout}초)")
+        print("PX4 SITL이 실행 중인지 확인하세요.")
+        print("mavlink-router가 이 포트로 메시지를 전달하는지 확인하세요.")
         
-    def get_safe_timestamp(self):
-        """struct.error 방지를 위한 안전한 uint64 타임스탬프"""
-        return int(time.time() * 1e6) & 0xFFFFFFFFFFFFFFFF
-    
-    def get_boot_timestamp_us(self):
-        """부팅 후 경과 시간 (마이크로초)"""
+        start = time.time()
+        while (time.time() - start) < timeout:
+            msg = self.master.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
+            if msg:
+                self.target_system = msg.get_srcSystem()
+                self.target_component = msg.get_srcComponent()
+                print(f"연결됨! System: {self.target_system}, Component: {self.target_component}")
+                return True
+        print("타임아웃: 하트비트를 받지 못했습니다.")
+        return False
+        
+    def get_safe_timestamp_us(self):
+        """uint64 범위 내 안전한 타임스탬프 (마이크로초)"""
         elapsed = time.time() - self.boot_time
-        return max(0, int(elapsed * 1e6)) & 0xFFFFFFFFFFFFFFFF
+        return int(elapsed * 1e6) & 0xFFFFFFFFFFFFFFFF
     
-    def send_hil_gps(self, lat_deg, lon_deg, alt_m, 
+    def send_hil_gps(self, lat_deg, lon_deg, alt_m,
                      vn_ms=0.0, ve_ms=0.0, vd_ms=0.0,
                      fix_type=3, satellites=12):
         """
-        HIL_GPS 메시지 송신 (struct.error 방지 완료)
+        HIL_GPS 메시지 송신
         
         Args:
-            lat_deg: 위도 (도 단위, 예: 37.5665)
-            lon_deg: 경도 (도 단위, 예: 126.9780)
-            alt_m: 고도 (미터, MSL 기준)
-            vn_ms: 북쪽 속도 (m/s)
-            ve_ms: 동쪽 속도 (m/s)
-            vd_ms: 아래쪽 속도 (m/s)
+            lat_deg: 위도 (도)
+            lon_deg: 경도 (도)
+            alt_m: 고도 (미터, MSL)
         """
         # 단위 변환
         lat_e7 = int(lat_deg * 1e7)
@@ -57,57 +73,70 @@ class SITLGPSSpoofer:
         alt_mm = int(alt_m * 1000)
         
         # 속도 변환 (m/s → cm/s)
-        vn_cms = int(vn_ms * 100)
-        ve_cms = int(ve_ms * 100)
-        vd_cms = int(vd_ms * 100)
+        vn_cms = max(-32768, min(32767, int(vn_ms * 100)))
+        ve_cms = max(-32768, min(32767, int(ve_ms * 100)))
+        vd_cms = max(-32768, min(32767, int(vd_ms * 100)))
         
-        # 지상 속도 계산
-        ground_speed_cms = int(math.sqrt(vn_ms**2 + ve_ms**2) * 100)
+        # 지상 속도
+        ground_speed_cms = max(0, min(65535, int(math.sqrt(vn_ms**2 + ve_ms**2) * 100)))
         
-        # 진행 방향 계산 (cdeg)
-        if vn_ms != 0 or ve_ms != 0:
-            cog = int(math.degrees(math.atan2(ve_ms, vn_ms)) * 100) % 36000
+        # 진행 방향 (cdeg)
+        if abs(vn_ms) > 0.1 or abs(ve_ms) > 0.1:
+            cog = int(math.degrees(math.atan2(ve_ms, vn_ms)) * 100)
+            if cog < 0:
+                cog += 36000
         else:
             cog = 0
             
-        self.master.mav.hil_gps_send(
-            self.get_boot_timestamp_us(),  # time_usec (안전한 uint64)
-            fix_type,                       # fix_type
-            lat_e7,                         # lat (degE7)
-            lon_e7,                         # lon (degE7)
-            alt_mm,                         # alt (mm)
-            100,                            # eph (1.0 HDOP * 100)
-            100,                            # epv (1.0 VDOP * 100)
-            ground_speed_cms,               # vel (cm/s)
-            vn_cms,                         # vn (cm/s)
-            ve_cms,                         # ve (cm/s)
-            vd_cms,                         # vd (cm/s)
-            cog,                            # cog (cdeg)
-            satellites                      # satellites_visible
-        )
+        try:
+            self.master.mav.hil_gps_send(
+                self.get_safe_timestamp_us(),
+                fix_type,
+                lat_e7,
+                lon_e7,
+                alt_mm,
+                100,  # eph (HDOP * 100)
+                100,  # epv (VDOP * 100)
+                ground_speed_cms,
+                vn_cms,
+                ve_cms,
+                vd_cms,
+                cog,
+                satellites
+            )
+            return True
+        except Exception as e:
+            print(f"HIL_GPS 전송 오류: {e}")
+            return False
+            
+    def receive_position(self):
+        """현재 드론 위치 수신"""
+        msg = self.master.recv_match(type='GLOBAL_POSITION_INT', blocking=False)
+        if msg:
+            return {
+                'lat': msg.lat / 1e7,
+                'lon': msg.lon / 1e7,
+                'alt': msg.alt / 1000,
+                'relative_alt': msg.relative_alt / 1000
+            }
+        return None
         
-    def gradual_spoof(self, target_lat, target_lon, target_alt,
+    def gradual_spoof(self, start_lat, start_lon, start_alt,
+                      target_lat, target_lon, target_alt,
                       duration_s=30, rate_hz=10):
         """
-        점진적 GPS 스푸핑 (EKF 탐지 회피)
+        점진적 GPS 스푸핑
         
         Args:
-            target_lat/lon/alt: 목표 가짜 위치
-            duration_s: 스푸핑 소요 시간 (초)
-            rate_hz: 메시지 전송 빈도 (Hz)
+            start_*: 시작 위치 (현재 위치)
+            target_*: 목표 가짜 위치
+            duration_s: 스푸핑 소요 시간
+            rate_hz: 전송 빈도
         """
-        # 현재 위치 획득
-        msg = self.master.recv_match(type='GPS_RAW_INT', blocking=True, timeout=5)
-        if msg:
-            self.original_lat = msg.lat / 1e7
-            self.original_lon = msg.lon / 1e7
-            self.original_alt = msg.alt / 1000
-        else:
-            print("현재 GPS 위치를 가져올 수 없음")
-            return
-            
-        print(f"원본 위치: {self.original_lat:.7f}, {self.original_lon:.7f}, {self.original_alt:.1f}m")
-        print(f"목표 위치: {target_lat:.7f}, {target_lon:.7f}, {target_alt:.1f}m")
+        print(f"\n=== 점진적 GPS 스푸핑 시작 ===")
+        print(f"시작: {start_lat:.6f}, {start_lon:.6f}, {start_alt:.1f}m")
+        print(f"목표: {target_lat:.6f}, {target_lon:.6f}, {target_alt:.1f}m")
+        print(f"소요시간: {duration_s}초, 빈도: {rate_hz}Hz")
         
         steps = int(duration_s * rate_hz)
         interval = 1.0 / rate_hz
@@ -116,41 +145,137 @@ class SITLGPSSpoofer:
             progress = i / steps
             
             # 선형 보간
-            current_lat = self.original_lat + (target_lat - self.original_lat) * progress
-            current_lon = self.original_lon + (target_lon - self.original_lon) * progress
-            current_alt = self.original_alt + (target_alt - self.original_alt) * progress
+            current_lat = start_lat + (target_lat - start_lat) * progress
+            current_lon = start_lon + (target_lon - start_lon) * progress
+            current_alt = start_alt + (target_alt - start_alt) * progress
             
             self.send_hil_gps(current_lat, current_lon, current_alt)
             
-            if i % (rate_hz * 5) == 0:  # 5초마다 상태 출력
-                print(f"진행: {progress*100:.1f}% - 현재 위치: {current_lat:.7f}, {current_lon:.7f}")
+            # 진행 상황 출력 (10% 단위)
+            if i % max(1, steps // 10) == 0:
+                print(f"[{progress*100:5.1f}%] 위치: {current_lat:.6f}, {current_lon:.6f}, {current_alt:.1f}m")
                 
             time.sleep(interval)
             
-        print("스푸핑 완료")
+        print("스푸핑 완료!")
+        
+    def constant_spoof(self, lat, lon, alt, duration_s=60, rate_hz=10):
+        """
+        고정 위치 GPS 스푸핑
+        """
+        print(f"\n=== 고정 위치 GPS 스푸핑 ===")
+        print(f"위치: {lat:.6f}, {lon:.6f}, {alt:.1f}m")
+        print(f"지속시간: {duration_s}초")
+        
+        interval = 1.0 / rate_hz
+        start_time = time.time()
+        count = 0
+        
+        while (time.time() - start_time) < duration_s:
+            self.send_hil_gps(lat, lon, alt)
+            count += 1
+            
+            if count % (rate_hz * 5) == 0:
+                elapsed = time.time() - start_time
+                print(f"[{elapsed:.1f}s] GPS 메시지 {count}개 전송됨")
+                
+            time.sleep(interval)
+            
+        print(f"완료: 총 {count}개 메시지 전송")
+
 
 def main():
-    """SITL UDP 모드 실행"""
-    print("=== SITL UDP GPS 스푸핑 시작 ===")
+    print("=" * 60)
+    print("SITL UDP GPS 스푸핑 - Windows 호환 버전")
+    print("=" * 60)
+    print()
     print("사전 요구사항:")
-    print("  1. param set SIM_GPS_BLOCK 1  # 시뮬레이터 GPS 차단")
-    print("  2. param set MAV_USEHILGPS 1  # HIL GPS 허용")
+    print("  1. PX4 SITL 실행 중")
+    print("  2. QGC 파라미터 설정:")
+    print("     - param set SIM_GPS_BLOCK 1")
+    print("     - param set MAV_USEHILGPS 1")
     print()
     
-    spoofer = SITLGPSSpoofer('udpout:127.0.0.1:14540')
-    spoofer.wait_heartbeat()
+    # 포트 선택 (QGC: 14550, API: 14540)
+    port = 14540
+    print(f"수신 포트: {port}")
+    print()
     
-    # 서울 → 부산 스푸핑 예시
-    SEOUL_LAT, SEOUL_LON = 37.5665, 126.9780
-    BUSAN_LAT, BUSAN_LON = 35.1796, 129.0756
+    try:
+        spoofer = SITLUDPSpoofer(listen_port=port)
+    except Exception as e:
+        print(f"연결 생성 실패: {e}")
+        sys.exit(1)
+        
+    if not spoofer.wait_heartbeat(timeout=30):
+        print("\n연결 실패. 다음을 확인하세요:")
+        print("  1. PX4 SITL이 실행 중인가?")
+        print("  2. mavlink-router가 포트 14540으로 전달하는가?")
+        print("  3. 방화벽이 UDP 포트를 차단하는가?")
+        sys.exit(1)
+        
+    print("\n=== 스푸핑 모드 선택 ===")
+    print("1. 고정 위치 스푸핑 (서울 → 부산)")
+    print("2. 점진적 스푸핑 (현재 위치 → 부산)")
+    print("3. 사용자 정의 좌표")
     
-    spoofer.gradual_spoof(
-        target_lat=BUSAN_LAT,
-        target_lon=BUSAN_LON,
-        target_alt=100.0,
-        duration_s=60,
-        rate_hz=10
-    )
+    choice = input("\n선택 (1-3): ").strip()
+    
+    # 서울/부산 좌표
+    SEOUL = (37.5665, 126.9780, 100.0)
+    BUSAN = (35.1796, 129.0756, 100.0)
+    
+    if choice == '1':
+        spoofer.constant_spoof(
+            lat=BUSAN[0],
+            lon=BUSAN[1],
+            alt=BUSAN[2],
+            duration_s=120,
+            rate_hz=10
+        )
+    elif choice == '2':
+        # 현재 위치 획득
+        print("현재 위치 획득 중...")
+        current_pos = None
+        for _ in range(50):
+            current_pos = spoofer.receive_position()
+            if current_pos:
+                break
+            time.sleep(0.1)
+            
+        if current_pos:
+            spoofer.gradual_spoof(
+                start_lat=current_pos['lat'],
+                start_lon=current_pos['lon'],
+                start_alt=current_pos['alt'],
+                target_lat=BUSAN[0],
+                target_lon=BUSAN[1],
+                target_alt=BUSAN[2],
+                duration_s=60,
+                rate_hz=10
+            )
+        else:
+            print("현재 위치를 가져올 수 없습니다. 서울에서 시작합니다.")
+            spoofer.gradual_spoof(
+                start_lat=SEOUL[0],
+                start_lon=SEOUL[1],
+                start_alt=SEOUL[2],
+                target_lat=BUSAN[0],
+                target_lon=BUSAN[1],
+                target_alt=BUSAN[2],
+                duration_s=60,
+                rate_hz=10
+            )
+    elif choice == '3':
+        lat = float(input("위도 (예: 35.1796): "))
+        lon = float(input("경도 (예: 129.0756): "))
+        alt = float(input("고도 (m, 예: 100): "))
+        duration = int(input("지속시간 (초, 예: 60): "))
+        
+        spoofer.constant_spoof(lat, lon, alt, duration_s=duration, rate_hz=10)
+    else:
+        print("잘못된 선택")
+
 
 if __name__ == "__main__":
     main()
