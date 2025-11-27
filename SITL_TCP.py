@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-import socket
 import time
 import math
 from pymavlink import mavutil
 
-tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-tcp_sock.connect(('127.0.0.1', 4560))
-
-mav = mavutil.mavlink_connection(tcp_sock, dialect='ardupilotmega')
+mav = mavutil.mavlink_connection('tcp:127.0.0.1:4560', dialect='ardupilotmega')
 
 mav.mav.set_mode_send(mav.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 6)
 time.sleep(0.5)
@@ -34,6 +30,7 @@ def recv_state():
     if msg:
         print(f"Received: {msg.get_type()}")
 
+print("SITL TCP 스푸핑 시작")
 for i in range(len(path)-1):
     lat1, lon1, alt1 = path[i]
     lat2, lon2, alt2 = path[i+1]
@@ -48,4 +45,4 @@ for i in range(len(path)-1):
         recv_state()
         time.sleep(0.1)
 
-tcp_sock.close()
+print("SITL TCP 스푸핑 완료")
