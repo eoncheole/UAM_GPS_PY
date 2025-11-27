@@ -23,7 +23,7 @@ path = [
 
 def send_fake_gps(lat, lon, alt):
     msg = mav.mav.gps_input_encode(
-        0, 0, 1<<3, int(time.time()*1000),
+        0, 0, 1<<3, int(time.time()*1000) % (2**32 - 1),
         0, int(lat*1e7), int(lon*1e7), int(alt*1000),
         15, 15, 5.0, 0, 0, 0, 10, 0, 0, 0
     )
