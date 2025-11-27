@@ -25,7 +25,7 @@ def send_fake_gps(lat, lon, alt):
     msg = mav.mav.gps_input_encode(
         0, 0, 1<<3, int(time.time()*1000),
         0, int(lat*1e7), int(lon*1e7), int(alt*1000),
-        15, 15, 5.0, 0, 0, 0, 10, 0, 0, 0, 0
+        15, 15, 5.0, 0, 0, 0, 10, 0, 0, 0
     )
     buf = msg.pack(mav.mav)
     gps_sock.sendto(buf, ('127.0.0.1', 14560))
@@ -44,6 +44,7 @@ def offboard_setpoint(lat, lon, alt, yaw_deg):
         0,0,0,0,0,0,0, math.radians(yaw_deg)
     )
 
+print("SITL UDP 스푸핑 시작")
 for i in range(len(path)-1):
     lat1, lon1, alt1 = path[i]
     lat2, lon2, alt2 = path[i+1]
@@ -60,3 +61,4 @@ for i in range(len(path)-1):
         time.sleep(0.1)
 
 gps_sock.close()
+print("SITL UDP 스푸핑 완료")
