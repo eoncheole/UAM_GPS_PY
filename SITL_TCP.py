@@ -3,7 +3,7 @@ import time
 import math
 from pymavlink import mavutil
 
-mav = mavutil.mavlink_connection('tcp:127.0.0.1:4560', dialect='ardupilotmega')
+mav = mavutil.mavlink_connection('tcp:127.0.0.1:4560', dialect='common')
 
 mav.mav.set_mode_send(mav.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 6)
 time.sleep(0.5)
@@ -18,7 +18,7 @@ path = [
 ]
 
 def send_spoof(lat, lon, alt, hdg):
-    ts = int(time.time() * 1e6)
+    ts = int(time.time() * 1e6) % (2**64 - 1)
     mav.mav.hil_gps_send(ts, 3, int(lat*1e7), int(lon*1e7), int(alt*1000), 30, 40, 1200, 0, 0, 0, 10, 0)
     mav.mav.hil_actuator_controls_send(ts, [0,0,0.60,0,0,0,0,0,0,0,0,0,0,0,0,0], 0, -1, 1)
     mav.mav.set_position_target_global_int_send(int(time.time()*1000), mav.target_system, mav.target_component,
